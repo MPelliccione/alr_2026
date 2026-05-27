@@ -1,0 +1,41 @@
+depth:
+  min: -0.4
+  max: -0.1
+font_size: 36
+mesh_size: 5
+domain_len_x: 140
+domain_len_y: 140
+domain_len_z: 2
+letter_subset:
+  - "A"
+  - "B"
+  - "C"
+  - "D"
+  - "E"
+  - "F"  
+  - "G"
+  - "H"
+  - "I"
+  - "J"
+  - "K"
+  - "L"
+  - "M"
+  - "N"
+  - "O"
+  - "P"
+  - "Q"
+  - "R"
+  - "S"
+  - "T"
+  - "U"
+  - "V"
+  - "W"
+  - "X"
+  - "Y"
+  - "Z"
+rotation_angles:
+  - 0
+  - 90
+  - 180
+  - 270
+rotate: true
