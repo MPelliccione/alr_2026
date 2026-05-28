@@ -7,22 +7,22 @@ shape and the action is a single force field applied once.
 
 from __future__ import annotations
 
+import math
+import pickle
 import time
+from pathlib import Path
 from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
-import logging
-
-# Reduce noisy debug output from the FEM backend during experiments.
-# Set the `jax_fem` logger to INFO to suppress DEBUG messages.
-logging.getLogger("jax_fem").setLevel(logging.INFO)
 
 from init_pde import initialize_empty_sims
 from simulation import parallel_simulation_step
 from target_shapes import generate_n_target_shapes
 from gym_env import NUM_NODES
+from gnn import build_grid_graph, init_gnn_params, apply_gnn_batched
 
 
 jax.config.update("jax_enable_x64", True)
@@ -34,18 +34,37 @@ CONFIG: dict[str, Any] = {
     "seed": 0,
     "updates": 200,
     "batch_size": 8,
-    "ppo_epochs": 20,
+    "ppo_epochs": 50,
     "lr": 3e-4,
     "max_force": 0.1,
     "clip_ratio": 0.2,
+    "mini_batch_size": 4,
+    "anneal_lr": True,
+    "anneal_clip_ratio": True,
+    "max_grad_norm": 0.5,
     "value_coef": 0.5,
     "entropy_coef": 1e-4,
     "init_log_std": -1.0,
-    "hidden_sizes": [256, 256],
+    "gnn_hidden_dim": 64,
+    "gnn_message_layers": 2,
     "log_every": 5,
     "save_path": None,
     "save_every": False,
 }
+
+
+def save_params(params: dict[str, Any], path: str | Path) -> None:
+    save_path = Path(path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    cpu_params = jax.tree_util.tree_map(lambda x: np.array(x), params)
+    with open(save_path, "wb") as f:
+        pickle.dump(cpu_params, f)
+
+
+def load_params(path: str | Path) -> dict[str, Any]:
+    with open(path, "rb") as f:
+        params = pickle.load(f)
+    return jax.tree_util.tree_map(jnp.array, params)
 
 
 def _linear_init(key: jax.Array, in_dim: int, out_dim: int) -> tuple[jax.Array, jax.Array]:
@@ -73,23 +92,43 @@ def _mlp_apply(params: list[tuple[jax.Array, jax.Array]], x: jax.Array) -> jax.A
 
 def init_actor_critic_params(
     key: jax.Array,
-    obs_dim: int,
     action_dim: int,
-    hidden_sizes: list[int],
+    gnn_hidden_dim: int,
+    gnn_message_layers: int,
     init_log_std: float = -1.0,
 ) -> dict[str, Any]:
-    trunk_key, policy_key, value_key, _ = jax.random.split(key, 4)
-    trunk = _mlp_init(trunk_key, [obs_dim] + hidden_sizes)
-    policy = _linear_init(policy_key, hidden_sizes[-1], action_dim)
-    value = _linear_init(value_key, hidden_sizes[-1], 1)
-    log_std = jnp.full((action_dim,), init_log_std)
-    return {"trunk": trunk, "policy": policy, "value": value, "log_std": log_std}
+    params = init_gnn_params(
+        key,
+        node_in_dim=7,
+        edge_in_dim=3,
+        hidden_dim=gnn_hidden_dim,
+        n_message_layers=gnn_message_layers,
+        num_nodes=action_dim,
+    )
+    params["log_std"] = jnp.full((action_dim,), init_log_std)
+    return params
 
 
-def _forward(params: dict[str, Any], obs: jax.Array) -> tuple[jax.Array, jax.Array]:
-    h = _mlp_apply(params["trunk"], obs)
-    mean = h @ params["policy"][0] + params["policy"][1]
-    value = jnp.squeeze(h @ params["value"][0] + params["value"][1], axis=-1)
+def _forward(
+    params: dict[str, Any],
+    obs: jax.Array,
+    edge_feats: jax.Array,
+    senders: jax.Array,
+    receivers: jax.Array,
+    node_coords: jax.Array,
+    boundary_mask: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    # obs: (B, NUM_NODES * 3)
+    targets = obs.reshape(-1, NUM_NODES, 3)
+    coords = jnp.broadcast_to(node_coords[None, :, :], targets.shape)
+    boundary = jnp.broadcast_to(boundary_mask[None, :, None], (targets.shape[0], NUM_NODES, 1))
+    node_feats = jnp.concatenate([targets, coords, boundary], axis=-1)
+
+    node_emb = apply_gnn_batched(params, node_feats, edge_feats, senders, receivers)
+    mean = (node_emb @ params["mean_head"][0] + params["mean_head"][1]).squeeze(-1)
+
+    pooled = jnp.mean(node_emb, axis=1)
+    value = jnp.squeeze(_mlp_apply(params["value_mlp"], pooled), axis=-1)
     return mean, value
 
 
@@ -114,8 +153,13 @@ def _sample_actions(
     params: dict[str, Any],
     obs: jax.Array,
     max_force: float,
+    edge_feats: jax.Array,
+    senders: jax.Array,
+    receivers: jax.Array,
+    node_coords: jax.Array,
+    boundary_mask: jax.Array,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    mean, value = _forward(params, obs)
+    mean, value = _forward(params, obs, edge_feats, senders, receivers, node_coords, boundary_mask)
     log_std = _clip_log_std(params["log_std"])
     key, noise_key = jax.random.split(key)
     noise = jax.random.normal(noise_key, mean.shape)
@@ -173,8 +217,13 @@ def _ppo_loss(
     value_coef: float,
     entropy_coef: float,
     max_force: float,
+    edge_feats: jax.Array,
+    senders: jax.Array,
+    receivers: jax.Array,
+    node_coords: jax.Array,
+    boundary_mask: jax.Array,
 ) -> tuple[jax.Array, tuple[jax.Array, jax.Array, jax.Array]]:
-    mean, value = _forward(params, batch["obs"])
+    mean, value = _forward(params, batch["obs"], edge_feats, senders, receivers, node_coords, boundary_mask)
     log_std = _clip_log_std(params["log_std"])
     log_prob = _log_prob_from_action(batch["action"], mean, log_std, max_force)
     ratio = jnp.exp(log_prob - batch["log_prob"])
@@ -191,22 +240,68 @@ def train(config: dict[str, Any]) -> None:
     key = jax.random.key(config["seed"])
     params = init_actor_critic_params(
         key,
-        obs_dim=OBS_DIM,
         action_dim=ACTION_DIM,
-        hidden_sizes=config["hidden_sizes"],
+        gnn_hidden_dim=config["gnn_hidden_dim"],
+        gnn_message_layers=config["gnn_message_layers"],
         init_log_std=config["init_log_std"],
     )
-    optimizer = optax.adam(config["lr"])
+    batch_size = int(config["batch_size"])
+    mini_batch_size = int(config["mini_batch_size"])
+    mini_batch_size = min(mini_batch_size, batch_size)
+    if mini_batch_size <= 0:
+        raise ValueError("mini_batch_size must be a positive integer")
+    num_minibatches = math.ceil(batch_size / mini_batch_size)
+    total_opt_steps = max(1, config["updates"] * config["ppo_epochs"] * num_minibatches)
+
+    if config["anneal_lr"]:
+        lr_schedule = optax.linear_schedule(
+            init_value=config["lr"],
+            end_value=0.0,
+            transition_steps=total_opt_steps,
+        )
+    else:
+        lr_schedule = config["lr"]
+
+    if config["max_grad_norm"]:
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(config["max_grad_norm"]),
+            optax.adam(lr_schedule),
+        )
+    else:
+        optimizer = optax.adam(lr_schedule)
     opt_state = optimizer.init(params)
 
     problems, _ = initialize_empty_sims(config["batch_size"], continuous_forces=False)
+    senders, receivers, edge_feats, node_coords, boundary_mask = build_grid_graph()
+    edge_feats = edge_feats.astype(jnp.float32)
+    node_coords = node_coords.astype(jnp.float32)
+    boundary_mask = boundary_mask.astype(jnp.float32)
+
+    opt_step = 0
+    save_every = config.get("save_every")
+    periodic_save = (
+        config["save_path"]
+        and isinstance(save_every, int)
+        and not isinstance(save_every, bool)
+        and save_every > 0
+    )
 
     for update in range(1, config["updates"] + 1):
         key, target_key = jax.random.split(key)
         targets, _ = _sample_targets(target_key, config["batch_size"])
         obs = targets.reshape(config["batch_size"], -1).astype(jnp.float32)
 
-        action, log_prob, value, key = _sample_actions(key, params, obs, config["max_force"])
+        action, log_prob, value, key = _sample_actions(
+            key,
+            params,
+            obs,
+            config["max_force"],
+            edge_feats,
+            senders,
+            receivers,
+            node_coords,
+            boundary_mask,
+        )
         reward, mse = _simulate_batch(problems, targets, action)
 
         returns = reward
@@ -221,19 +316,54 @@ def train(config: dict[str, Any]) -> None:
             "returns": returns,
         }
 
+        total_loss = 0.0
+        total_policy = 0.0
+        total_value = 0.0
+        total_entropy = 0.0
+        total_batches = 0
+
         for _ in range(config["ppo_epochs"]):
-            (loss, (policy_loss, value_loss, entropy)), grads = jax.value_and_grad(
-                _ppo_loss, has_aux=True
-            )(
-                params,
-                batch,
-                config["clip_ratio"],
-                config["value_coef"],
-                config["entropy_coef"],
-                config["max_force"],
-            )
-            updates, opt_state = optimizer.update(grads, opt_state, params)
-            params = optax.apply_updates(params, updates)
+            key, perm_key = jax.random.split(key)
+            perm = jax.random.permutation(perm_key, batch_size)
+            for start in range(0, batch_size, mini_batch_size):
+                idx = perm[start : start + mini_batch_size]
+                mini_batch = {k: v[idx] for k, v in batch.items()}
+
+                if config["anneal_clip_ratio"]:
+                    denom = max(1, total_opt_steps - 1)
+                    current_clip = config["clip_ratio"] * (1.0 - (opt_step / denom))
+                else:
+                    current_clip = config["clip_ratio"]
+
+                (loss, (policy_loss, value_loss, entropy)), grads = jax.value_and_grad(
+                    _ppo_loss, has_aux=True
+                )(
+                    params,
+                    mini_batch,
+                    current_clip,
+                    config["value_coef"],
+                    config["entropy_coef"],
+                    config["max_force"],
+                    edge_feats,
+                    senders,
+                    receivers,
+                    node_coords,
+                    boundary_mask,
+                )
+                updates, opt_state = optimizer.update(grads, opt_state, params)
+                params = optax.apply_updates(params, updates)
+
+                total_loss += float(loss)
+                total_policy += float(policy_loss)
+                total_value += float(value_loss)
+                total_entropy += float(entropy)
+                total_batches += 1
+                opt_step += 1
+
+        loss = total_loss / max(1, total_batches)
+        policy_loss = total_policy / max(1, total_batches)
+        value_loss = total_value / max(1, total_batches)
+        entropy = total_entropy / max(1, total_batches)
 
         if update % config["log_every"] == 0 or update == 1:
             print(
@@ -242,13 +372,11 @@ def train(config: dict[str, Any]) -> None:
                 f"policy {float(policy_loss):.6f} | value {float(value_loss):.6f}"
             )
 
-        # Checkpointing block kept but disabled for testing.
-        # To enable saving, replace the condition with: `if config["save_path"] and update % config["save_every"] == 0:`
-        if False and config["save_path"] and update % config["save_every"] == 0:
-            with open(config["save_path"], "wb") as f:
-                import pickle
+        if periodic_save and update % save_every == 0:
+            save_params(params, config["save_path"])
 
-                pickle.dump(params, f)
+    if config["save_path"]:
+        save_params(params, config["save_path"])
 
 
 if __name__ == "__main__":

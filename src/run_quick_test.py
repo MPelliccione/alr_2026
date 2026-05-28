@@ -20,7 +20,12 @@ if __name__ == "__main__":
             "batch_size": 2,
             "ppo_epochs": 1,
             "lr": 1e-3,
-            "hidden_sizes": [64, 64],
+            "mini_batch_size": 2,
+            "anneal_lr": False,
+            "anneal_clip_ratio": False,
+            "max_grad_norm": 0.5,
+            "gnn_hidden_dim": 32,
+            "gnn_message_layers": 1,
             "log_every": 1,
             "save_path": None,
         }

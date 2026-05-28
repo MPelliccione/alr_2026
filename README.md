@@ -95,6 +95,19 @@ JAX_ENABLE_X64=True python src/example_disc_forces.py
 JAX_ENABLE_X64=True python src/example_cont_forces.py
 ```
 
+## PPO Training and Inference
+To save a checkpoint during or after training, set `CONFIG["save_path"]` (and optionally `CONFIG["save_every"]`) in [src/train_ppo.py](src/train_ppo.py). Then run training:
+
+```bash
+JAX_ENABLE_X64=True python src/train_ppo.py
+```
+
+For inference and VTK export, edit `CONFIG` in [src/run_inference.py](src/run_inference.py) (set `checkpoint_path`, `letter`, and `save_dir` as needed), then run:
+
+```bash
+JAX_ENABLE_X64=True python src/run_inference.py
+```
+
 
 ## Viewing Results
 The easiest and best way to visualize your results is by installing [Paraview](https://www.paraview.org/download/) and converting the `jax.Array` meshes to vtk files.
